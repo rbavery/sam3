@@ -32,16 +32,14 @@ def _export_image_encoder(model: torch.nn.Module, images: torch.Tensor):
     if images.shape[0] == 1:
         export_images = images.repeat(2, 1, 1, 1)
     with torch.no_grad():
-        height = torch.export.Dim("height", min=3, max=4)
-        width = torch.export.Dim("width", min=3, max=4)
         exported = torch.export.export(
             wrapper,
             (export_images,),
             dynamic_shapes={
                 "images": {
                     0: torch.export.Dim("batch", min=1, max=4),
-                    2: 336 * height,
-                    3: 336 * width,
+                    2: 1008,
+                    3: 1008,
                 }
             },
             strict=False,

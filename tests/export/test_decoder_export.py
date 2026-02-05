@@ -69,15 +69,17 @@ class FullInferenceWrapper(torch.nn.Module):
         )
 
 
-def _make_inputs(batch: int, height: int, width: int, device: str):
+def _make_inputs(batch: int, height: int, width: int, device: str, num_boxes: int = 0):
     images = torch.randn(batch, 3, height, width, device=device)
     token_ids = torch.ones(batch, 32, device=device, dtype=torch.long)
     token_ids[:, -1] = 0
     img_ids = torch.arange(batch, device=device, dtype=torch.long)
     text_ids = torch.zeros(batch, device=device, dtype=torch.long)
-    box_embeddings = torch.zeros(0, batch, 4, device=device)
-    box_mask = torch.zeros(batch, 0, device=device, dtype=torch.bool)
-    box_labels = torch.zeros(0, batch, device=device, dtype=torch.long)
+    box_embeddings = torch.rand(num_boxes, batch, 4, device=device)
+    if num_boxes > 0:
+        box_embeddings[..., 2:] = box_embeddings[..., 2:] * 0.5
+    box_mask = torch.zeros(batch, num_boxes, device=device, dtype=torch.bool)
+    box_labels = torch.zeros(num_boxes, batch, device=device, dtype=torch.long)
     return images, token_ids, img_ids, text_ids, box_embeddings, box_mask, box_labels
 
 
@@ -93,6 +95,14 @@ def _export_decoder(model: torch.nn.Module, inputs):
     ) = inputs
     device = images.device
     wrapper = FullInferenceWrapper(model).to(device).eval()  # type: ignore[arg-type]
+    if images.shape[0] == 1:
+        images = images.repeat(2, 1, 1, 1)
+        token_ids = token_ids.repeat(2, 1)
+        img_ids = img_ids.repeat(2)
+        text_ids = text_ids.repeat(2)
+        box_embeddings = box_embeddings.repeat(1, 2, 1)
+        box_mask = box_mask.repeat(2, 1)
+        box_labels = box_labels.repeat(1, 2)
     with torch.no_grad():
         exported = torch.export.export(
             wrapper,
@@ -118,15 +128,15 @@ def _export_decoder(model: torch.nn.Module, inputs):
                 "img_ids": {0: torch.export.Dim.AUTO},
                 "text_ids": {0: torch.export.Dim.AUTO},
                 "box_embeddings": {
-                    0: torch.export.Dim("num_boxes", min=0, max=32),
+                    0: 1,
                     1: torch.export.Dim.AUTO,
                 },
                 "box_mask": {
                     0: torch.export.Dim.AUTO,
-                    1: torch.export.Dim("num_boxes", min=0, max=32),
+                    1: 1,
                 },
                 "box_labels": {
-                    0: torch.export.Dim("num_boxes", min=0, max=32),
+                    0: 1,
                     1: torch.export.Dim.AUTO,
                 },
             },
@@ -138,7 +148,7 @@ def _export_decoder(model: torch.nn.Module, inputs):
 
 def test_decoder_export_static(sam3_model):
     device = get_device()
-    inputs = _make_inputs(1, 1008, 1008, device)
+    inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
     with capture_stderr_on_fail("export_static"):
         exported = _export_decoder(sam3_model, inputs)
     assert exported is not None
@@ -146,7 +156,7 @@ def test_decoder_export_static(sam3_model):
 
 def test_decoder_export_loads(sam3_model):
     device = get_device()
-    inputs = _make_inputs(1, 1008, 1008, device)
+    inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
     with capture_stderr_on_fail("export_loads"):
         exported = _export_decoder(sam3_model, inputs)
     module = exported.module()
@@ -158,7 +168,7 @@ def test_decoder_export_loads(sam3_model):
 
 def test_decoder_export_matches_eager(sam3_model):
     device = get_device()
-    inputs = _make_inputs(1, 1008, 1008, device)
+    inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
     wrapper = FullInferenceWrapper(sam3_model).to(device).eval()
     with torch.no_grad():
         eager_out = wrapper(*inputs)
@@ -176,11 +186,11 @@ def test_decoder_export_matches_eager(sam3_model):
 
 def test_decoder_export_dynamic_batch(sam3_model):
     device = get_device()
-    inputs = _make_inputs(1, 1008, 1008, device)
+    inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
     with capture_stderr_on_fail("export_dynamic_batch"):
         exported = _export_decoder(sam3_model, inputs)
     module = exported.module()
-    new_inputs = _make_inputs(2, 1008, 1008, device)
+    new_inputs = _make_inputs(2, 1008, 1008, device, num_boxes=1)
     with torch.no_grad():
         out = module(*new_inputs)
     assert isinstance(out, tuple)
@@ -188,11 +198,11 @@ def test_decoder_export_dynamic_batch(sam3_model):
 
 def test_decoder_export_dynamic_spatial(sam3_model):
     device = get_device()
-    inputs = _make_inputs(1, 1008, 1008, device)
+    inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
     with capture_stderr_on_fail("export_dynamic_spatial"):
         exported = _export_decoder(sam3_model, inputs)
     module = exported.module()
-    new_inputs = _make_inputs(1, 1008, 1008, device)
+    new_inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
     with torch.no_grad():
         out = module(*new_inputs)
     assert isinstance(out, tuple)
@@ -200,11 +210,11 @@ def test_decoder_export_dynamic_spatial(sam3_model):
 
 def test_decoder_export_full_dynamic(sam3_model):
     device = get_device()
-    inputs = _make_inputs(1, 1008, 1008, device)
+    inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
     with capture_stderr_on_fail("export_full_dynamic"):
         exported = _export_decoder(sam3_model, inputs)
     module = exported.module()
-    new_inputs = _make_inputs(3, 1008, 1008, device)
+    new_inputs = _make_inputs(2, 1008, 1008, device, num_boxes=1)
     with torch.no_grad():
         out = module(*new_inputs)
     assert isinstance(out, tuple)
@@ -213,11 +223,11 @@ def test_decoder_export_full_dynamic(sam3_model):
 @pytest.mark.parametrize("batch", [1, 2])
 def test_decoder_export_inference_shapes(sam3_model, batch: int):
     device = get_device()
-    inputs = _make_inputs(1, 1008, 1008, device)
+    inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
     with capture_stderr_on_fail("export_inference_shapes"):
         exported = _export_decoder(sam3_model, inputs)
     module = exported.module()
-    new_inputs = _make_inputs(batch, 1008, 1008, device)
+    new_inputs = _make_inputs(batch, 1008, 1008, device, num_boxes=1)
     with torch.no_grad():
         out = module(*new_inputs)
     assert isinstance(out, tuple)

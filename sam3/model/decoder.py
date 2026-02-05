@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sam3.sam.transformer import RoPEAttention
 from torch import nn, Tensor
 from torchvision.ops.roi_align import RoIAlign
@@ -152,23 +153,39 @@ class TransformerDecoderLayer(nn.Module):
             tgt = self.catext_norm(tgt)
 
         if presence_token is not None and cross_attn_mask is not None:
-            presence_token_mask = torch.zeros_like(cross_attn_mask[:, :1, :])
-            cross_attn_mask = torch.cat(
-                [presence_token_mask, cross_attn_mask], dim=1
-            )  # (bs*nheads, 1+nq, hw)
+            if cross_attn_mask.dim() == 4:
+                presence_token_mask = torch.zeros_like(cross_attn_mask[:, :, :1, :])
+                cross_attn_mask = torch.cat(
+                    [presence_token_mask, cross_attn_mask], dim=2
+                )  # (bs, nheads, 1+nq, hw)
+            else:
+                presence_token_mask = torch.zeros_like(cross_attn_mask[:, :1, :])
+                cross_attn_mask = torch.cat(
+                    [presence_token_mask, cross_attn_mask], dim=1
+                )  # (bs*nheads, 1+nq, hw)
 
         # Cross attention to image
-        tgt2 = self.cross_attn(
-            query=self.with_pos_embed(tgt, tgt_query_pos),
-            key=self.with_pos_embed(memory, memory_pos),
-            value=memory,
-            attn_mask=cross_attn_mask,
-            key_padding_mask=(
-                memory_key_padding_mask.transpose(0, 1)
-                if memory_key_padding_mask is not None
-                else None
-            ),
-        )[0]
+        key_padding_mask = (
+            memory_key_padding_mask.transpose(0, 1)
+            if memory_key_padding_mask is not None
+            else None
+        )
+        if cross_attn_mask is not None and cross_attn_mask.dim() == 4:
+            tgt2 = self._cross_attn_with_rpb(
+                query=self.with_pos_embed(tgt, tgt_query_pos),
+                key=self.with_pos_embed(memory, memory_pos),
+                value=memory,
+                attn_bias=cross_attn_mask,
+                key_padding_mask=key_padding_mask,
+            )
+        else:
+            tgt2 = self.cross_attn(
+                query=self.with_pos_embed(tgt, tgt_query_pos),
+                key=self.with_pos_embed(memory, memory_pos),
+                value=memory,
+                attn_mask=cross_attn_mask,
+                key_padding_mask=key_padding_mask,
+            )[0]
 
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
@@ -182,6 +199,44 @@ class TransformerDecoderLayer(nn.Module):
             tgt = tgt[1:]
 
         return tgt, presence_token_out
+
+    def _cross_attn_with_rpb(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_bias: Tensor,
+        key_padding_mask: Optional[Tensor],
+    ) -> Tensor:
+        mha = self.cross_attn
+        assert isinstance(mha, nn.MultiheadAttention)
+        q, k, v = F._in_projection_packed(
+            query, key, value, mha.in_proj_weight, mha.in_proj_bias
+        )
+        tgt_len, bsz, _ = q.shape
+        num_heads = mha.num_heads
+        head_dim = mha.head_dim
+        q = q.contiguous().view(tgt_len, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        k = k.contiguous().view(-1, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        v = v.contiguous().view(-1, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        src_len = k.shape[2]
+        bias = attn_bias
+        if bias.dim() == 3:
+            bias = bias.view(bsz, num_heads, tgt_len, src_len)
+        if key_padding_mask is not None:
+            pad = key_padding_mask[:, None, None, :].to(dtype=q.dtype)
+            pad = pad.masked_fill(pad > 0, float("-inf"))
+            bias = pad if bias is None else bias + pad
+        attn_output = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=bias,
+            dropout_p=mha.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        attn_output = attn_output.permute(2, 0, 1, 3).reshape(tgt_len, bsz, -1)
+        return F.linear(attn_output, mha.out_proj.weight, mha.out_proj.bias)
 
 
 class TransformerDecoder(nn.Module):
@@ -498,9 +553,8 @@ class TransformerDecoder(nn.Module):
             # conditional query
             query_pos = self.ref_point_head(query_sine_embed)  # nq, bs, d_model
 
-            compiling = torch.compiler.is_dynamo_compiling() or torch._dynamo.is_compiling()
             memory_mask = None
-            if self.boxRPB != "none" and reference_boxes is not None and not compiling:
+            if self.boxRPB != "none" and reference_boxes is not None:
                 assert spatial_shapes.shape[0] == 1, (
                     "only single scale support implemented"
                 )
@@ -508,7 +562,6 @@ class TransformerDecoder(nn.Module):
                     reference_boxes,
                     (spatial_shapes[0, 0], spatial_shapes[0, 1]),
                 )
-                memory_mask = memory_mask.flatten(0, 1)  # (bs*n_heads, nq, H*W)
             if self.training:
                 assert self.use_act_checkpoint, (
                     "Activation checkpointing not enabled in the decoder"
