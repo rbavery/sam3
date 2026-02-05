@@ -151,7 +151,7 @@ class TransformerDecoderLayer(nn.Module):
             tgt = tgt + self.catext_dropout(tgt2)
             tgt = self.catext_norm(tgt)
 
-        if presence_token is not None:
+        if presence_token is not None and cross_attn_mask is not None:
             presence_token_mask = torch.zeros_like(cross_attn_mask[:, :1, :])
             cross_attn_mask = torch.cat(
                 [presence_token_mask, cross_attn_mask], dim=1
@@ -333,10 +333,7 @@ class TransformerDecoder(nn.Module):
             self.compilable_cord_cache = self._get_coords(H, W, reference_boxes.device)
             self.compilable_stored_size = (H, W)
 
-        if torch.compiler.is_dynamo_compiling() or self.compilable_stored_size == (
-            H,
-            W,
-        ):
+        if torch.compiler.is_dynamo_compiling():
             # good, hitting the cache, will be compilable
             coords_h, coords_w = self.compilable_cord_cache
         else:
@@ -348,8 +345,6 @@ class TransformerDecoder(nn.Module):
                 )
             coords_h, coords_w = self.coord_cache[feat_size]
 
-            assert coords_h.shape == (H,)
-            assert coords_w.shape == (W,)
 
         deltas_y = coords_h.view(1, -1, 1) - boxes_xyxy.reshape(-1, 1, 4)[:, :, 1:4:2]
         deltas_y = deltas_y.view(bs, num_queries, -1, 2)
@@ -388,20 +383,13 @@ class TransformerDecoder(nn.Module):
             act_ckpt_enable=self.training and self.use_act_checkpoint,
         )  # bs, num_queries, H, n_heads
 
-        if not torch.compiler.is_dynamo_compiling():
-            assert deltas_x.shape[:3] == (bs, num_queries, W)
-            assert deltas_y.shape[:3] == (bs, num_queries, H)
 
         B = deltas_y.unsqueeze(3) + deltas_x.unsqueeze(
             2
         )  # bs, num_queries, H, W, n_heads
-        if not torch.compiler.is_dynamo_compiling():
-            assert B.shape[:4] == (bs, num_queries, H, W)
         B = B.flatten(2, 3)  # bs, num_queries, H*W, n_heads
         B = B.permute(0, 3, 1, 2)  # bs, n_heads, num_queries, H*W
         B = B.contiguous()  # memeff attn likes ordered strides
-        if not torch.compiler.is_dynamo_compiling():
-            assert B.shape[2:] == (num_queries, H * W)
         return B
 
     def forward(
@@ -510,7 +498,9 @@ class TransformerDecoder(nn.Module):
             # conditional query
             query_pos = self.ref_point_head(query_sine_embed)  # nq, bs, d_model
 
-            if self.boxRPB != "none" and reference_boxes is not None:
+            compiling = torch.compiler.is_dynamo_compiling() or torch._dynamo.is_compiling()
+            memory_mask = None
+            if self.boxRPB != "none" and reference_boxes is not None and not compiling:
                 assert spatial_shapes.shape[0] == 1, (
                     "only single scale support implemented"
                 )
